@@ -9,6 +9,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"os/exec"
 	"os/signal"
 	"syscall"
 	"time"
@@ -66,25 +67,31 @@ func main() {
 	}
 	defer coll.Close()
 
-	// Attach TC ingress and egress hooks
+	// Set up TC qdisc (clsact)
 	iface := "eth0" // Replace with your network interface
+	if err := setupTC(iface); err != nil {
+		log.Fatalf("Failed to set up TC qdisc: %v", err)
+	}
+	defer cleanupTC(iface)
+
+	// Attach TC ingress and egress hooks
 	ingressProg := coll.Programs["tc_ingress_func"]
 	egressProg := coll.Programs["tc_egress_func"]
 
-	ingressLink, err := link.AttachTC(link.TCOptions{
-		Interface: iface,
+	ingressLink, err := link.AttachTCX(link.TCXOptions{
 		Program:   ingressProg,
-		Attach:    ebpf.AttachTCIngress,
+		Interface: iface,
+		Direction: "ingress",
 	})
 	if err != nil {
 		log.Fatalf("Failed to attach TC ingress: %v", err)
 	}
 	defer ingressLink.Close()
 
-	egressLink, err := link.AttachTC(link.TCOptions{
-		Interface: iface,
+	egressLink, err := link.AttachTCX(link.TCXOptions{
 		Program:   egressProg,
-		Attach:    ebpf.AttachTCEgress,
+		Interface: iface,
+		Direction: "egress",
 	})
 	if err != nil {
 		log.Fatalf("Failed to attach TC egress: %v", err)
@@ -92,11 +99,12 @@ func main() {
 	defer egressLink.Close()
 
 	// Open ring buffer
-	rb, err := coll.Maps["netflow_ringbuf"].OpenRingBuf()
+	rb := coll.Maps["netflow_ringbuf"]
+	ringBuf, err := ebpf.NewRingBuf(rb, nil)
 	if err != nil {
 		log.Fatalf("Failed to open ring buffer: %v", err)
 	}
-	defer rb.Close()
+	defer ringBuf.Close()
 
 	// Initialize Kafka writer
 	kafkaWriter := &kafka.Writer{
@@ -114,7 +122,7 @@ func main() {
 	go func() {
 		var record NetFlowRecord
 		for {
-			event, err := rb.Read()
+			event, err := ringBuf.Read()
 			if err != nil {
 				log.Printf("Error reading ring buffer: %v", err)
 				continue
@@ -173,5 +181,23 @@ func protocolToString(proto uint8) string {
 		return "UDP"
 	default:
 		return fmt.Sprintf("Unknown(%d)", proto)
+	}
+}
+
+// setupTC configures the clsact qdisc for the interface
+func setupTC(iface string) error {
+	// Add clsact qdisc
+	cmd := exec.Command("tc", "qdisc", "add", "dev", iface, "clsact")
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("failed to add clsact qdisc: %v", err)
+	}
+	return nil
+}
+
+// cleanupTC removes the clsact qdisc
+func cleanupTC(iface string) {
+	cmd := exec.Command("tc", "qdisc", "del", "dev", iface, "clsact")
+	if err := cmd.Run(); err != nil {
+		log.Printf("Failed to delete clsact qdisc: %v", err)
 	}
 }
