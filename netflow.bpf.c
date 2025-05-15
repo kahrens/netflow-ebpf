@@ -1,9 +1,13 @@
+//go:build ignore
+
 #include <linux/bpf.h>
+#include <linux/in.h>
 #include <linux/if_ether.h>
 #include <linux/ip.h>
 #include <linux/ipv6.h>
 #include <linux/tcp.h>
 #include <linux/udp.h>
+#include <linux/pkt_cls.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
@@ -38,10 +42,20 @@ struct netflow_record {
 };
 
 // BPF hash map to store flow metrics
-BPF_HASH(flow_table, struct flow_key, struct flow_metrics, 65536);
+//BPF_HASH(flow_table, struct flow_key, struct flow_metrics, 65536);
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 64 * 1024);
+	__type(key, struct flow_key);
+	__type(value, struct flow_metrics);
+} flow_table SEC(".maps");
 
 // BPF ring buffer to send NetFlow records to user space
-BPF_RINGBUF(netflow_ringbuf, 1 << 20); // 1MB ring buffer
+//BPF_RINGBUF(netflow_ringbuf, 1 << 20); // 1MB ring buffer
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 1024 * 1024);  /* 1 MB */
+} netflow_ringbuf SEC(".maps");
 
 // Helper to process IPv4 packets
 static __always_inline int process_ipv4(struct __sk_buff *skb, __u8 is_ingress) {
@@ -100,6 +114,7 @@ static __always_inline int process_ipv4(struct __sk_buff *skb, __u8 is_ingress) 
             .last_ts = ts,
         };
         bpf_map_update_elem(&flow_table, &key, &new_metrics, BPF_ANY);
+        metrics = &new_metrics;
     } else {
         metrics->packets++;
         metrics->bytes += bpf_ntohs(ip->tot_len);

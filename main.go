@@ -1,3 +1,5 @@
+//go:build linux
+
 package main
 
 import (
@@ -16,12 +18,10 @@ import (
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
+	"github.com/cilium/ebpf/ringbuf"
 	"github.com/cilium/ebpf/rlimit"
 	"github.com/segmentio/kafka-go"
 )
-
-//go:embed bpf/netflow.bpf.c
-var bpfCode string
 
 // NetFlowRecord matches the C struct netflow_record
 type NetFlowRecord struct {
@@ -55,52 +55,60 @@ func main() {
 		log.Fatalf("Failed to remove memlock: %v", err)
 	}
 
-	// Load eBPF program
-	spec, err := ebpf.LoadCollectionSpecFromReader(bytes.NewReader([]byte(bpfCode)))
-	if err != nil {
-		log.Fatalf("Failed to load eBPF spec: %v", err)
+	if len(os.Args) < 2 {
+		log.Fatalf("Please specify a network interface")
 	}
 
-	coll, err := ebpf.NewCollection(spec)
+	// Look up the network interface by name.
+	ifaceName := os.Args[1]
+	iface, err := net.InterfaceByName(ifaceName)
 	if err != nil {
-		log.Fatalf("Failed to create eBPF collection: %v", err)
+		log.Fatalf("lookup network iface %q: %s", ifaceName, err)
 	}
-	defer coll.Close()
+
+	// Load the compiled eBPF ELF and load it into the kernel.
+	objs := netflowObjects{}
+	if err := loadNetflowObjects(&objs, nil); err != nil {
+		log.Fatal("Loading eBPF objects:", err)
+	}
+	defer objs.Close()
 
 	// Set up TC qdisc (clsact)
-	iface := "eth0" // Replace with your network interface
-	if err := setupTC(iface); err != nil {
+	if err := setupTC(ifaceName); err != nil {
 		log.Fatalf("Failed to set up TC qdisc: %v", err)
 	}
-	defer cleanupTC(iface)
+	defer cleanupTC(ifaceName)
 
-	// Attach TC ingress and egress hooks
-	ingressProg := coll.Programs["tc_ingress_func"]
-	egressProg := coll.Programs["tc_egress_func"]
-
+	// Attach the program to Ingress TC.
 	ingressLink, err := link.AttachTCX(link.TCXOptions{
-		Program:   ingressProg,
-		Interface: iface,
-		Direction: "ingress",
+		Interface: iface.Index,
+		Program:   objs.TcIngressFunc,
+		Attach:    ebpf.AttachTCXIngress,
 	})
 	if err != nil {
-		log.Fatalf("Failed to attach TC ingress: %v", err)
+		log.Fatalf("could not attach TCx program: %s", err)
 	}
 	defer ingressLink.Close()
 
+	log.Printf("Attached TCx program to INGRESS iface %q (index %d)", iface.Name, iface.Index)
+
+	// Attach the program to Egress TC.
 	egressLink, err := link.AttachTCX(link.TCXOptions{
-		Program:   egressProg,
-		Interface: iface,
-		Direction: "egress",
+		Interface: iface.Index,
+		Program:   objs.TcEgressFunc,
+		Attach:    ebpf.AttachTCXEgress,
 	})
 	if err != nil {
-		log.Fatalf("Failed to attach TC egress: %v", err)
+		log.Fatalf("could not attach TCx program: %s", err)
 	}
 	defer egressLink.Close()
 
+	log.Printf("Attached TCx program to EGRESS iface %q (index %d)", iface.Name, iface.Index)
+	log.Printf("Press Ctrl-C to exit and remove the program")
+
 	// Open ring buffer
-	rb := coll.Maps["netflow_ringbuf"]
-	ringBuf, err := ebpf.NewRingBuf(rb, nil)
+	rb := objs.NetflowRingbuf
+	ringBuf, err := ringbuf.NewReader(rb)
 	if err != nil {
 		log.Fatalf("Failed to open ring buffer: %v", err)
 	}
